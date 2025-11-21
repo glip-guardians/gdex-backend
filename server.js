@@ -1,4 +1,4 @@
-// server.js  — G-DEX backend (0x v2 allowance-holder API, single-unit-conversion)
+// server.js  — G-DEX backend (0x v2 allowance-holder API, single-unit-conversion + feeRecipient)
 
 // Node 18+ 에서는 fetch 가 글로벌로 존재합니다.
 const express = require("express");
@@ -6,6 +6,10 @@ const cors = require("cors");
 const bodyParser = require("body-parser");
 
 const app = express();
+
+// ------------------------
+// CORS 허용 도메인
+// ------------------------
 const allowedOrigins = [
   "https://gdex-app.com",
   "https://www.gdex-app.com",
@@ -33,9 +37,21 @@ app.use((req, res, next) => {
 app.use(cors());
 app.use(bodyParser.json());
 
+// ------------------------
+// 환경변수 & 상수
+// ------------------------
 const PORT = process.env.PORT || 8080;
 const ZEROX_API_KEY = process.env.ZEROX_API_KEY;
 const ZEROX_BASE = "https://api.0x.org";
+
+// ✅ 수수료(인티그레이터 fee) 설정
+// - FEE_RECIPIENT: 수수료를 받을 지갑 주소
+// - FEE_PERCENTAGE: buyToken 기준 퍼센트 (예: 0.001 = 0.1%, 0.01 = 1%)
+const FEE_RECIPIENT = "0xd840b263bed70c8ef3728ddcae64d482e7fdd513";
+const FEE_PERCENTAGE = 0.001; // 0.1% 수수료 — 필요시 숫자만 변경
+
+// 0x ETH sentinel
+const ETH_SENTINEL = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE";
 
 if (!ZEROX_API_KEY) {
   console.warn("[WARN] ZEROX_API_KEY is not set in environment variables.");
@@ -83,6 +99,7 @@ async function call0x(url) {
  *  - sellAmount 는 프런트에서 이미 10^decimals 로
  *    스케일링된 "wei 문자열" 이라고 가정한다.
  *  - 여기서는 절대 추가 변환을 하지 않는다.
+ *  - ✅ 여기에서 feeRecipient / buyTokenPercentageFee 추가
  * ------------------------------------------------------*/
 function buildParams(body) {
   const chainId = body.chainId || 1; // Ethereum 메인넷
@@ -105,6 +122,15 @@ function buildParams(body) {
   const slippageBps = Math.round(slip * 10000);
   params.set("slippageBps", String(slippageBps));
 
+  // ✅ 0x 수수료 파라미터 추가
+  // - feeRecipient: 수수료를 받을 주소
+  // - buyTokenPercentageFee: 수수료 비율 (소수, 예: 0.001 = 0.1%)
+  //   price / quote 둘 다 동일하게 붙여야 미리보기/실제 체결이 일치
+  if (FEE_RECIPIENT && FEE_PERCENTAGE > 0) {
+    params.set("feeRecipient", FEE_RECIPIENT);
+    params.set("buyTokenPercentageFee", String(FEE_PERCENTAGE));
+  }
+
   return params;
 }
 
@@ -120,7 +146,7 @@ app.post("/quote", async (req, res) => {
   try {
     const params = buildParams(req.body);
 
-    // allowance-holder price 엔드포인트
+    // allowance-holder price 엔드포인트 (수수료 포함된 가격)
     const url = `${ZEROX_BASE}/swap/allowance-holder/price?${params.toString()}`;
     const priceData = await call0x(url);
 
@@ -141,7 +167,7 @@ app.post("/swap", async (req, res) => {
     const params = buildParams(req.body);
     params.set("intentOnFilling", "true");
 
-    // allowance-holder quote 엔드포인트 (tx 생성)
+    // allowance-holder quote 엔드포인트 (tx 생성, 수수료 포함)
     const url = `${ZEROX_BASE}/swap/allowance-holder/quote?${params.toString()}`;
     const quoteData = await call0x(url);
 
@@ -157,20 +183,19 @@ app.post("/swap", async (req, res) => {
 
     // 2) ETH를 파는 경우(sellToken = ETH sentinel)에는
     //    사용자가 입력한 sellAmount(wei)를 그대로 value 로 사용
-    const ETH_SENTINEL = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE";
-
     if (req.body.sellToken === ETH_SENTINEL) {
-      tx.value = req.body.sellAmount;           // 0.0023 ETH → 2300000000000000
+      tx.value = String(req.body.sellAmount); // 예: 0.0023 ETH → 2300000000000000
     } else {
       // ERC-20 → 어떤 토큰 스왑: 일반적으로 value = 0 이어야 함
-      // 혹시나 0x가 fee 등으로 value 를 요구하면 그대로 따라가고,
+      // 혹시 0x가 fee 등으로 value 를 요구하면 그대로 따라가고,
       // 둘 다 없으면 "0"
       tx.value = rawTx.value ?? quoteData.value ?? "0";
     }
 
-    // **gas / gasPrice 는 일단 보내지 않고, MetaMask 가 재계산하게 둔다**
-    // tx.gas = rawTx.gas;
-    // tx.gasPrice = rawTx.gasPrice;
+    // ✅ gas / gasPrice 는 MetaMask 에게 맡김 (0x에서 온 값을 강제하지 않음)
+    // 필요하면 아래를 다시 활성화
+    // if (rawTx.gas != null)      tx.gas      = rawTx.gas;
+    // if (rawTx.gasPrice != null) tx.gasPrice = rawTx.gasPrice;
 
     if (!tx.to || !tx.data) {
       console.error("[/swap] missing tx fields in 0x response", quoteData);
@@ -193,11 +218,7 @@ app.post("/swap", async (req, res) => {
   }
 });
 
-
 // 서버 시작
 app.listen(PORT, () => {
   console.log(`G-DEX backend listening on port ${PORT}`);
 });
-
-
-
