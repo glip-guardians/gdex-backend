@@ -111,11 +111,13 @@ app.post("/swap", async (req, res) => {
     const url = `${ZEROX_BASE}/swap/allowance-holder/quote?${params.toString()}`;
     const quoteData = await call0x(url);
 
-    // 0x v2 응답은 to / data / value 를 top-level 로 내려줌
+    // 0x v2 allowance-holder 응답에서는 tx 정보가 transaction 안에 들어있음
+    const txSrc = quoteData.transaction || {};
+
     const tx = {
-      to: quoteData.to,
-      data: quoteData.data,
-      value: quoteData.value || "0",
+      to: txSrc.to,
+      data: txSrc.data,
+      value: txSrc.value || "0",
     };
 
     if (!tx.to || !tx.data) {
@@ -137,7 +139,9 @@ app.post("/swap", async (req, res) => {
   }
 });
 
+
 // 서버 시작
 app.listen(PORT, () => {
   console.log(`G-DEX backend listening on port ${PORT}`);
 });
+
