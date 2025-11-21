@@ -145,40 +145,32 @@ app.post("/swap", async (req, res) => {
     const url = `${ZEROX_BASE}/swap/allowance-holder/quote?${params.toString()}`;
     const quoteData = await call0x(url);
 
-    // 0x v2 응답: transaction 또는 tx 안에 트랜잭션 세부 정보가 있음
-    const rawTx =
-      quoteData.transaction ||
-      quoteData.tx ||
-      {
-        to: quoteData.to,
-        data: quoteData.data,
-        value: quoteData.value,
-        gas: quoteData.gas,
-        gasPrice: quoteData.gasPrice,
-      };
+    // 0x v2 응답: transaction 안에 트랜잭션 세부 정보
+    const rawTx = quoteData.transaction || {};
 
-// ETH sentinel 주소 (프론트에서 쓰는 것과 동일해야 함)
-const ETH_SENTINEL = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE";
+    // ====== 우리가 보낼 tx 구성 ======
+    // 1) to, data는 0x 것을 그대로 사용
+    const tx = {
+      to: rawTx.to,
+      data: rawTx.data,
+    };
 
-// ...
+    // 2) ETH를 파는 경우(sellToken = ETH sentinel)에는
+    //    사용자가 입력한 sellAmount(wei)를 그대로 value 로 사용
+    const ETH_SENTINEL = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE";
 
-// /swap 라우트 안
-let valueToUse = rawTx.value ?? quoteData.value ?? "0";
+    if (req.body.sellToken === ETH_SENTINEL) {
+      tx.value = req.body.sellAmount;           // 0.0023 ETH → 2300000000000000
+    } else {
+      // ERC-20 → 어떤 토큰 스왑: 일반적으로 value = 0 이어야 함
+      // 혹시나 0x가 fee 등으로 value 를 요구하면 그대로 따라가고,
+      // 둘 다 없으면 "0"
+      tx.value = rawTx.value ?? quoteData.value ?? "0";
+    }
 
-// sellToken 이 ETH 일 때는 0x 가 준 value 를 믿지 않고,
-// 프런트에서 넘어온 sellAmount(wei)를 그대로 value 로 사용
-if ((req.body.sellToken || "").toLowerCase() === ETH_SENTINEL.toLowerCase()) {
-  valueToUse = req.body.sellAmount;
-}
-
-const tx = {
-  to: rawTx.to,
-  data: rawTx.data,
-  value: valueToUse,
-  gas: rawTx.gas ?? quoteData.gas ?? undefined,
-  gasPrice: rawTx.gasPrice ?? quoteData.gasPrice ?? undefined,
-};
-
+    // **gas / gasPrice 는 일단 보내지 않고, MetaMask 가 재계산하게 둔다**
+    // tx.gas = rawTx.gas;
+    // tx.gasPrice = rawTx.gasPrice;
 
     if (!tx.to || !tx.data) {
       console.error("[/swap] missing tx fields in 0x response", quoteData);
@@ -188,7 +180,9 @@ const tx = {
       });
     }
 
-    // 프런트: const tx = swapRes.tx; 로 사용
+    console.log("[/swap] final tx sent to frontend:", tx);
+
+    // 프런트: const tx = swapRes.tx || swapRes;
     res.json({ tx });
   } catch (err) {
     console.error("[/swap] error", err.status, err.details || err.message);
@@ -199,9 +193,11 @@ const tx = {
   }
 });
 
+
 // 서버 시작
 app.listen(PORT, () => {
   console.log(`G-DEX backend listening on port ${PORT}`);
 });
+
 
 
