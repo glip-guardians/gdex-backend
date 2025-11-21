@@ -1,96 +1,131 @@
-// server.js
+// server.js  — G-DEX backend proxy (0x Swap API)
 
-require("dotenv").config();
 const express = require("express");
-const axios = require("axios");
 const cors = require("cors");
 
 const app = express();
+const PORT = process.env.PORT || 8080;
+const ZEROX_BASE = "https://api.0x.org";
+
 app.use(cors());
 app.use(express.json());
 
-const PORT = process.env.PORT || 8080;
-const API_KEY = process.env.ZEROX_API_KEY;
-const ZEROX_BASE = "https://api.0x.org";
-
-// 🚦 Health Check
-app.get("/health", (req, res) => {
-  res.json({ status: "ok", message: "G-DEX Backend Alive!" });
+// 간단한 헬스 체크 (브라우저로 접속 시 확인용)
+app.get("/", (req, res) => {
+  res.send("G-DEX backend is running.");
 });
 
-// -------------------------------------------
-// 1) Price Preview (GET /quote)
-//    프론트에서 미리보기 용으로 사용
-//    예: /quote?sellToken=0xeee...&buyToken=0xA0b8...&sellAmount=1000000000000000
-// -------------------------------------------
-app.get("/quote", async (req, res) => {
+// 0x 호출 공통 함수
+async function call0x(relativePath, params) {
+  const url = new URL(relativePath, ZEROX_BASE);
+  Object.entries(params || {}).forEach(([k, v]) => {
+    if (v !== undefined && v !== null) {
+      url.searchParams.set(k, String(v));
+    }
+  });
+
+  const headers = { accept: "application/json" };
+  if (process.env.ZEROX_API_KEY) {
+    headers["0x-api-key"] = process.env.ZEROX_API_KEY;
+  }
+
+  const resp = await fetch(url.toString(), { headers });
+  const text = await resp.text();
+
+  if (!resp.ok) {
+    console.error("0x error", resp.status, text);
+    throw new Error(text || `0x error ${resp.status}`);
+  }
+  return JSON.parse(text);
+}
+
+/**
+ * POST /quote
+ *  프리뷰용 — 0x quote 를 그대로 반환 (buyAmount, price 등 포함)
+ *  body: { sellToken, buyToken, sellAmount, slippagePercentage? }
+ */
+app.post("/quote", async (req, res) => {
   try {
-    const { sellToken, buyToken, sellAmount, taker } = req.query;
+    const { sellToken, buyToken, sellAmount, slippagePercentage } = req.body || {};
 
     if (!sellToken || !buyToken || !sellAmount) {
-      return res.status(400).json({ error: "sellToken, buyToken, sellAmount required" });
+      return res.status(400).json({
+        error: "MISSING_PARAMS",
+        message: "sellToken, buyToken and sellAmount are required."
+      });
     }
 
-    const response = await axios.get(`${ZEROX_BASE}/swap/permit2/quote`, {
-      params: {
-        chainId: 1,
-        sellToken,
-        buyToken,
-        sellAmount,
-        taker,              // 선택값 (없으면 undefined 그대로 전달)
-      },
-      headers: {
-        "0x-api-key": API_KEY,
-        "0x-version": "v2",
-      },
+    // unified 0x swap quote — 주소 형식 토큰 사용 (ETH → 0xEeee...)
+    const quote = await call0x("/swap/quote", {
+      sellToken,
+      buyToken,
+      sellAmount,
+      ...(slippagePercentage ? { slippagePercentage } : {})
     });
 
-    res.json(response.data);
+    // 프런트에서 buyAmount, price 등 자유롭게 사용
+    res.json(quote);
   } catch (err) {
-    console.error("0x quote error:", err.response?.data || err.message);
-    res.status(400).json(err.response?.data || { error: err.message });
+    console.error("[/quote] error", err);
+    res.status(500).send(err.message || "quote error");
   }
 });
 
-// -------------------------------------------
-// 2) Execute Swap (POST /swap)
-//    프론트에서 실제 스왑 직전에 호출해서
-//    to / data / value 를 받아서 MetaMask에 전달
-// -------------------------------------------
+/**
+ * POST /swap
+ *  실제 스왑용 — MetaMask 에 바로 보낼 수 있는 트랜잭션 필드만 반환
+ *  body: { sellToken, buyToken, sellAmount, taker, slippagePercentage? }
+ */
 app.post("/swap", async (req, res) => {
   try {
-    const { sellToken, buyToken, sellAmount, taker } = req.body;
+    const { sellToken, buyToken, sellAmount, taker, slippagePercentage } = req.body || {};
 
     if (!sellToken || !buyToken || !sellAmount || !taker) {
-      return res
-        .status(400)
-        .json({ error: "sellToken, buyToken, sellAmount, taker required" });
+      return res.status(400).json({
+        error: "MISSING_PARAMS",
+        message: "sellToken, buyToken, sellAmount and taker are required."
+      });
     }
 
-    const response = await axios.get(`${ZEROX_BASE}/swap/permit2/quote`, {
-      params: {
-        chainId: 1,
-        sellToken,
-        buyToken,
-        sellAmount,
-        taker,
-      },
-      headers: {
-        "0x-api-key": API_KEY,
-        "0x-version": "v2",
-      },
+    // 0x에서 quote + tx 데이터까지 한번에 받기
+    const quote = await call0x("/swap/quote", {
+      sellToken,
+      buyToken,
+      sellAmount,
+      taker,
+      intentOnFilling: "true",
+      ...(slippagePercentage ? { slippagePercentage } : {})
     });
 
-    res.json(response.data);
+    // 프런트에서 필요한 필드만 정리해서 반환
+    const tx = {
+      to: quote.to,
+      data: quote.data,
+      value: quote.value ?? "0x0",
+      gas: quote.gas,
+      gasPrice: quote.gasPrice,
+      allowanceTarget: quote.allowanceTarget,
+      sellTokenAddress: quote.sellToken,
+      buyTokenAddress: quote.buyToken,
+      sellAmount: quote.sellAmount,
+      buyAmount: quote.buyAmount,
+    };
+
+    if (!tx.to || !tx.data) {
+      console.error("[/swap] missing to/data in 0x quote", quote);
+      return res.status(500).json({
+        error: "NO_TX_FIELDS",
+        message: "0x quote did not include transaction data."
+      });
+    }
+
+    res.json(tx);
   } catch (err) {
-    console.error("0x swap error:", err.response?.data || err.message);
-    res.status(400).json(err.response?.data || { error: err.message });
+    console.error("[/swap] error", err);
+    res.status(500).send(err.message || "swap error");
   }
 });
 
-// -------------------------------------------
-// 서버 시작
-// -------------------------------------------
 app.listen(PORT, () => {
-  console.log(`🚀 G-DEX Backend running on port ${PORT}`);
+  console.log(`🚀 G-DEX backend listening on port ${PORT}`);
 });
