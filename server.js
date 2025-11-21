@@ -6,6 +6,30 @@ const cors = require("cors");
 const bodyParser = require("body-parser");
 
 const app = express();
+const allowedOrigins = [
+  "https://gdex-app.com",
+  "https://www.gdex-app.com",
+  "https://glip-guardians.github.io"
+];
+
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+
+  if (allowedOrigins.includes(origin)) {
+    res.header("Access-Control-Allow-Origin", origin);
+  }
+
+  res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Content-Type, 0x-api-key");
+  res.header("Access-Control-Allow-Credentials", "true");
+
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(200);
+  }
+
+  next();
+});
+
 app.use(cors());
 app.use(bodyParser.json());
 
@@ -179,4 +203,5 @@ const tx = {
 app.listen(PORT, () => {
   console.log(`G-DEX backend listening on port ${PORT}`);
 });
+
 
