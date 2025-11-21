@@ -1,122 +1,162 @@
-// server.js
-require("dotenv").config();
+// server.js — G-DEX 0x AllowanceHolder(v2) backend
+
 const express = require("express");
 const cors = require("cors");
-const axios = require("axios");
+
+// Node 18 이상이면 전역 fetch 가 있지만, 안전하게 node-fetch fallback 추가
+let fetchFn = global.fetch;
+if (!fetchFn) {
+  fetchFn = (...args) =>
+    import("node-fetch").then(({ default: fetch }) => fetch(...args));
+}
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 8080;
+const ZEROX_API_KEY = process.env.ZEROX_API_KEY; // Render 환경변수에 설정한 값
+const ZEROX_BASE = "https://api.0x.org";
 
-// 🔑 0x API 설정
-//   - ZEROX_BASE_URL 이 없으면 기본으로 "이더리움 메인넷" 엔드포인트 사용
-const ZEROX_BASE_URL =
-  process.env.ZEROX_BASE_URL || "https://api.0x.org"; // ★ 중요: 메인넷
-const ZEROX_API_KEY = process.env.ZEROX_API_KEY || "";
+// 공통 0x 호출 helper (AllowanceHolder v2)
+async function call0xSwap(endpoint, params) {
+  const url = new URL(`${ZEROX_BASE}/swap/allowance-holder/${endpoint}`);
 
-console.log("[config] ZEROX_BASE_URL =", ZEROX_BASE_URL);
+  // 쿼리 스트링 구성
+  Object.entries(params || {}).forEach(([k, v]) => {
+    if (v !== undefined && v !== null && v !== "") {
+      url.searchParams.set(k, String(v));
+    }
+  });
 
-const axios0x = axios.create({
-  baseURL: ZEROX_BASE_URL,
-  headers: ZEROX_API_KEY ? { "0x-api-key": ZEROX_API_KEY } : {},
-});
+  const headers = {
+    accept: "application/json",
+    "0x-version": "v2",
+  };
+  if (ZEROX_API_KEY) headers["0x-api-key"] = ZEROX_API_KEY;
 
-// 헬스체크
+  console.log("0x request:", url.toString());
+
+  const res = await fetchFn(url.toString(), { headers });
+  const text = await res.text();
+  let data;
+  try {
+    data = text ? JSON.parse(text) : {};
+  } catch {
+    data = { raw: text };
+  }
+
+  if (!res.ok) {
+    console.error(`0x error ${res.status}`, data);
+    const msg =
+      (data && (data.message || data.reason)) ||
+      "no Route matched with those values";
+    // 프런트에 넘길 간단한 에러 형태
+    const payload = { message: msg };
+    const err = new Error(msg);
+    err.status = res.status;
+    err.payload = payload;
+    throw err;
+  }
+
+  return data;
+}
+
+// 헬스 체크용
 app.get("/", (_req, res) => {
   res.send("G-DEX backend is running.");
 });
 
-// 공통 0x 호출 함수 (GET /swap/v1/quote)
-async function call0xSwapQuote(params) {
-  const qs = new URLSearchParams(params).toString();
-  const url = `/swap/v1/quote?${qs}`;
-
-  console.log("0x request:", ZEROX_BASE_URL + url);
-
-  try {
-    const { data } = await axios0x.get(url);
-    return data;
-  } catch (err) {
-    const status = err.response?.status;
-    const data = err.response?.data;
-
-    console.error("0x error", status, data || err.message);
-
-    // 프런트에서 보기 좋게 메시지만 뽑아서 보내기
-    let msg = "0x error";
-    if (data && typeof data === "object") {
-      if (data.message) msg = data.message;
-      else msg = JSON.stringify(data);
-    } else if (typeof data === "string") {
-      msg = data;
-    } else if (err.message) {
-      msg = err.message;
-    }
-
-    const error = new Error(msg);
-    error.status = status || 500;
-    throw error;
-  }
-}
-
-// ===== /quote =====
-// 프런트 자동 계산용
+/**
+ * /quote
+ *  - 프런트의 “자동계산(미리보기)” 용
+ *  - 0x AllowanceHolder /price 사용
+ */
 app.post("/quote", async (req, res) => {
   try {
-    const { sellToken, buyToken, sellAmount, slippagePercentage } = req.body;
+    const { sellToken, buyToken, sellAmount } = req.body;
+
+    if (!sellToken || !buyToken || !sellAmount) {
+      return res
+        .status(400)
+        .json({ message: "sellToken, buyToken, sellAmount are required." });
+    }
 
     const params = {
+      chainId: 1, // Ethereum mainnet
       sellToken,
       buyToken,
       sellAmount,
+      // slippage는 가격 미리보기에서는 굳이 보낼 필요 없음 (기본값 사용)
     };
-    if (slippagePercentage != null)
-      params.slippagePercentage = String(slippagePercentage);
 
-    const quote = await call0xSwapQuote(params);
-    return res.json(quote);
-  } catch (e) {
-    console.error("[/quote] error", e);
-    res.status(e.status || 500).json({ message: e.message });
+    const price = await call0xSwap("price", params);
+    res.json(price);
+  } catch (err) {
+    console.error("[/quote] error", err);
+    res
+      .status(err.status || 500)
+      .json(err.payload || { message: err.message || "Internal error" });
   }
 });
 
-// ===== /swap =====
-// 실제 지갑에 보낼 트랜잭션 생성용
+/**
+ * /swap
+ *  - 실제 스왑 실행용
+ *  - 0x AllowanceHolder /quote 사용 (firm quote)
+ */
 app.post("/swap", async (req, res) => {
   try {
-    const { sellToken, buyToken, sellAmount, taker, slippagePercentage } =
-      req.body;
-
-    const params = {
+    const {
       sellToken,
       buyToken,
       sellAmount,
-      taker, // 메타마스크 주소 (taker)
-    };
-    if (slippagePercentage != null)
-      params.slippagePercentage = String(slippagePercentage);
+      taker, // 사용자의 지갑 주소
+      slippagePercentage, // 프런트에서 넘어온 슬리피지 (예: 0.02)
+    } = req.body;
 
-    const quote = await call0xSwapQuote(params);
-
-    // 메타마스크에 넘겨줄 필드만 추리기
-    const { to, data, value, gas, gasPrice } = quote;
-    if (!to || !data) {
-      return res.status(500).json({
-        message: "0x quote did not return tx fields (to/data).",
-        raw: quote,
+    if (!sellToken || !buyToken || !sellAmount || !taker) {
+      return res.status(400).json({
+        message: "sellToken, buyToken, sellAmount, taker are required.",
       });
     }
 
-    return res.json({ to, data, value, gas, gasPrice });
-  } catch (e) {
-    console.error("[/swap] error", e);
-    res.status(e.status || 500).json({ message: e.message });
+    // 2% → 200 bps 로 변환 (1% = 100 bps)
+    let slippageBps;
+    if (typeof slippagePercentage === "number" && !isNaN(slippagePercentage)) {
+      slippageBps = Math.round(slippagePercentage * 10000);
+    }
+
+    const params = {
+      chainId: 1,
+      sellToken,
+      buyToken,
+      sellAmount,
+      taker,
+      ...(slippageBps ? { slippageBps } : {}),
+    };
+
+    const quote = await call0xSwap("quote", params);
+
+    // MetaMask에 넘길 트랜잭션 필드만 프런트로 리턴
+    const tx = {
+      to: quote.to,
+      data: quote.data,
+      value: quote.value, // 없으면 undefined 그대로 두면 됨
+      gas: quote.gas,
+      gasPrice: quote.gasPrice,
+    };
+
+    res.json(tx);
+  } catch (err) {
+    console.error("[/swap] error", err);
+    res
+      .status(err.status || 500)
+      .json(err.payload || { message: err.message || "Internal error" });
   }
 });
 
+// 서버 시작
 app.listen(PORT, () => {
   console.log(`G-DEX backend listening on port ${PORT}`);
 });
