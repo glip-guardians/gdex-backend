@@ -133,14 +133,28 @@ app.post("/swap", async (req, res) => {
         gasPrice: quoteData.gasPrice,
       };
 
-    const tx = {
-      to: rawTx.to,
-      data: rawTx.data,
-      // value는 transaction.value 또는 top-level value 사용, 없으면 "0"
-      value: rawTx.value ?? quoteData.value ?? "0",
-      gas: rawTx.gas ?? quoteData.gas ?? undefined,
-      gasPrice: rawTx.gasPrice ?? quoteData.gasPrice ?? undefined,
-    };
+// ETH sentinel 주소 (프론트에서 쓰는 것과 동일해야 함)
+const ETH_SENTINEL = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE";
+
+// ...
+
+// /swap 라우트 안
+let valueToUse = rawTx.value ?? quoteData.value ?? "0";
+
+// sellToken 이 ETH 일 때는 0x 가 준 value 를 믿지 않고,
+// 프런트에서 넘어온 sellAmount(wei)를 그대로 value 로 사용
+if ((req.body.sellToken || "").toLowerCase() === ETH_SENTINEL.toLowerCase()) {
+  valueToUse = req.body.sellAmount;
+}
+
+const tx = {
+  to: rawTx.to,
+  data: rawTx.data,
+  value: valueToUse,
+  gas: rawTx.gas ?? quoteData.gas ?? undefined,
+  gasPrice: rawTx.gasPrice ?? quoteData.gasPrice ?? undefined,
+};
+
 
     if (!tx.to || !tx.data) {
       console.error("[/swap] missing tx fields in 0x response", quoteData);
@@ -165,3 +179,4 @@ app.post("/swap", async (req, res) => {
 app.listen(PORT, () => {
   console.log(`G-DEX backend listening on port ${PORT}`);
 });
+
