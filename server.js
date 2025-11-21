@@ -1,81 +1,103 @@
-// server.js
-require("dotenv").config();
+// server.js  — G-DEX backend (0x Swap API v2, allowance-holder)
+
 const express = require("express");
-const axios = require("axios");
 const cors = require("cors");
+const axios = require("axios");
 
 const app = express();
-
-// Render 에서 PORT 환경변수 넣어둔 값, 없으면 8080
-const PORT = process.env.PORT || 8080;
-// Render > Environment 에 넣어둔 0x API 키
-const API_KEY = process.env.ZEROX_API_KEY;
-
-const ZEROX_BASE = "https://api.0x.org";
-
 app.use(cors());
 app.use(express.json());
 
-// 헬퍼: 0x 헤더
-function zeroXHeaders() {
-  const h = {};
-  if (API_KEY) h["0x-api-key"] = API_KEY;
-  return h;
+// 환경 변수
+const PORT = process.env.PORT || 8080;
+const ZEROX_API_KEY = process.env.ZEROX_API_KEY;
+
+// 0x Swap API (allowance-holder) v2 설정
+const SWAP_BASE = "https://api.0x.org/swap/allowance-holder";
+const CHAIN_ID = 1;
+
+// G-DEX용 taker(스왑을 실제로 실행하는 주소) – 지금은 그냥 프론트에서 보내주는 값 사용
+// 필요시 고정 주소로 바꿀 수 있음
+// const DEFAULT_TAKER = "0xYOUR_TAKER_ADDRESS";
+
+// 공통 헤더 (0x-version 꼭 들어가야 함)
+function build0xHeaders() {
+  if (!ZEROX_API_KEY) {
+    console.warn("[WARN] ZEROX_API_KEY is not set");
+  }
+  return {
+    "Accept": "application/json",
+    "0x-api-key": ZEROX_API_KEY || "",
+    "0x-version": "v2",
+  };
 }
 
-// 헬퍼: 슬리피지(0.02) → bps("200")
-function pctToBps(slip) {
-  if (slip == null || isNaN(slip)) return "200";
-  const bps = Math.round(Number(slip) * 10000); // 0.02 -> 200
-  return String(Math.max(1, bps));
+// slippage (% → bps)
+function pctToBps(pct) {
+  const n = Number(pct);
+  if (!Number.isFinite(n) || n <= 0) return 200; // default 2%
+  return Math.round(n * 100);
 }
 
-// 헬스 체크
-app.get("/", (req, res) => {
-  res.send("G-DEX backend is running.");
-});
+// 0x로 price / quote 호출
+async function call0x(path, params) {
+  const qs = new URLSearchParams(params).toString();
+  const url = `${SWAP_BASE}/${path}?${qs}`;
+  console.log("0x request:", url);
+
+  const res = await axios.get(url, { headers: build0xHeaders() });
+  console.log("0x response status:", res.status);
+  return res.data;
+}
 
 /**
- * /quote  : 가격 미리보기 용 (프론트 자동계산)
- * 0x 엔드포인트: /swap/allowance-holder/price
+ * POST /quote
+ * 프론트에서 자동계산(미리보기)용으로 사용
+ * body: { sellToken, buyToken, sellAmount, slippagePercentage }
  */
 app.post("/quote", async (req, res) => {
   try {
-    const { sellToken, buyToken, sellAmount, slippagePercentage } = req.body || {};
-
-    if (!sellToken || !buyToken || !sellAmount) {
-      return res
-        .status(400)
-        .json({ message: "sellToken, buyToken, sellAmount are required" });
-    }
-
-    const params = new URLSearchParams({
-      chainId: "1",
+    const {
       sellToken,
       buyToken,
       sellAmount,
-      slippageBps: pctToBps(slippagePercentage),
-    });
+      slippagePercentage,
+      taker,
+    } = req.body || {};
 
-    const url = `${ZEROX_BASE}/swap/allowance-holder/price?${params.toString()}`;
-    console.log("0x request [price]:", url);
+    if (!sellToken || !buyToken || !sellAmount) {
+      return res.status(400).json({ message: "Missing params" });
+    }
 
-    const resp = await axios.get(url, { headers: zeroXHeaders() });
-    console.log("0x price status", resp.status);
+    const slippageBps = pctToBps(slippagePercentage);
+    const params = {
+      chainId: String(CHAIN_ID),
+      sellToken,
+      buyToken,
+      sellAmount,
+      taker: taker || undefined,        // taker가 있으면 전달
+      slippageBps: String(slippageBps), // v2에서는 slippageBps
+    };
 
-    // 👉 가격 관련 데이터 그대로 프런트에 전달
-    return res.json(resp.data);
+    const data = await call0x("price", params); // allowance-holder/price
+    return res.json(data);
   } catch (err) {
+    console.error("[/quote] error", err.response?.data || err.message);
     const status = err.response?.status || 500;
-    const payload = err.response?.data || { message: err.message || "0x quote error" };
-    console.error("[/quote] error", status, payload);
-    return res.status(status).json(payload);
+    return res.status(status).json(
+      err.response?.data || {
+        message: err.message || "Quote error",
+      }
+    );
   }
 });
 
 /**
- * /swap : 실제 스왑 트랜잭션 생성
- * 0x 엔드포인트: /swap/allowance-holder/quote
+ * POST /swap
+ * 실제 스왑 실행용. 0x firm quote를 받아서
+ * 프론트가 메타마스크에 그대로 보내게끔 tx 필드만 추려서 반환
+ *
+ * body: { sellToken, buyToken, sellAmount, taker, slippagePercentage }
  */
 app.post("/swap", async (req, res) => {
   try {
@@ -83,42 +105,66 @@ app.post("/swap", async (req, res) => {
       sellToken,
       buyToken,
       sellAmount,
-      taker, // 지갑 주소 (프런트에서 userAddress)
+      taker,
       slippagePercentage,
     } = req.body || {};
 
     if (!sellToken || !buyToken || !sellAmount || !taker) {
-      return res.status(400).json({
-        message: "sellToken, buyToken, sellAmount, taker are required",
-      });
+      return res.status(400).json({ message: "Missing params" });
     }
 
-    const params = new URLSearchParams({
-      chainId: "1",
+    const slippageBps = pctToBps(slippagePercentage);
+    const params = {
+      chainId: String(CHAIN_ID),
       sellToken,
       buyToken,
       sellAmount,
+      buyTokenPercentageFee: "0", // 수수료 안 붙이는 기본값
       taker,
-      slippageBps: pctToBps(slippagePercentage),
+      slippageBps: String(slippageBps),
       intentOnFilling: "true",
-    });
+    };
 
-    const url = `${ZEROX_BASE}/swap/allowance-holder/quote?${params.toString()}`;
-    console.log("0x request [swap]:", url);
+    // allowance-holder/quote → firm quote + transaction data
+    const quote = await call0x("quote", params);
 
-    const resp = await axios.get(url, { headers: zeroXHeaders() });
-    console.log("0x swap status", resp.status);
-    console.log("[/swap raw 0x data]", Object.keys(resp.data));
+    // v2 응답 구조에서 트랜잭션 필드 추출
+    // (transaction 오브젝트가 있으면 그 안에서, 없으면 루트에서)
+    const tx = quote.transaction || quote;
 
-    // 🔥 핵심: 0x가 준 응답을 그대로 프런트에 전달
-    // (여기에 to / data / value / gas / gasPrice 가 포함되어 있음)
-    return res.json(resp.data);
+    if (!tx || !tx.to || !tx.data) {
+      console.error("[/swap] invalid tx object from 0x:", quote);
+      return res.status(500).json({
+        message: "0x quote did not include transaction fields",
+      });
+    }
+
+    const txOut = {
+      to: tx.to,
+      data: tx.data,
+      value: tx.value || "0x0",
+    };
+
+    // gas, gasPrice가 있으면 그대로 같이 넘겨줌 (선택 사항)
+    if (tx.gas) txOut.gas = tx.gas;
+    if (tx.gasPrice) txOut.gasPrice = tx.gasPrice;
+
+    console.log("[/swap] txOut", txOut);
+    return res.json(txOut);
   } catch (err) {
+    console.error("[/swap] error", err.response?.data || err.message);
     const status = err.response?.status || 500;
-    const payload = err.response?.data || { message: err.message || "0x swap error" };
-    console.error("[/swap] error", status, payload);
-    return res.status(status).json(payload);
+    return res.status(status).json(
+      err.response?.data || {
+        message: err.message || "Swap error",
+      }
+    );
   }
+});
+
+// 헬스체크용
+app.get("/", (_req, res) => {
+  res.json({ ok: true, service: "G-DEX backend", version: "0x-v2" });
 });
 
 app.listen(PORT, () => {
