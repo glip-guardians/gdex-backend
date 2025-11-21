@@ -140,7 +140,7 @@ app.post("/swap", async (req, res) => {
     }
 
     // 프런트 코드: const tx = swapRes;  로 바로 사용 가능하게
-    res.json(tx);
+    res.json({ tx });
   } catch (err) {
     console.error("[/swap] error", err.status, err.details || err.message);
     res.status(err.status || 500).json({
@@ -154,3 +154,4 @@ app.post("/swap", async (req, res) => {
 app.listen(PORT, () => {
   console.log(`G-DEX backend listening on port ${PORT}`);
 });
+
