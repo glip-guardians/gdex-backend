@@ -68,7 +68,7 @@ function buildParams(body) {
     chainId: String(chainId),
     sellToken,
     buyToken,
-    sellAmount, // 이미 wei 기준 문자열로 들어온다고 가정 (추가 변환 X)
+    sellAmount: String(sellAmount), // 방어적으로 문자열로 캐스팅
   });
 
   if (taker) {
@@ -121,14 +121,25 @@ app.post("/swap", async (req, res) => {
     const url = `${ZEROX_BASE}/swap/allowance-holder/quote?${params.toString()}`;
     const quoteData = await call0x(url);
 
-    // 0x v2 응답: transaction 안에 트랜잭션 세부 정보
-    const rawTx = quoteData.transaction || {};
+    // 0x v2 응답: transaction 또는 tx 안에 트랜잭션 세부 정보가 있음
+    const rawTx =
+      quoteData.transaction ||
+      quoteData.tx ||
+      {
+        to: quoteData.to,
+        data: quoteData.data,
+        value: quoteData.value,
+        gas: quoteData.gas,
+        gasPrice: quoteData.gasPrice,
+      };
 
     const tx = {
       to: rawTx.to,
       data: rawTx.data,
       // value는 transaction.value 또는 top-level value 사용, 없으면 "0"
       value: rawTx.value ?? quoteData.value ?? "0",
+      gas: rawTx.gas ?? quoteData.gas ?? undefined,
+      gasPrice: rawTx.gasPrice ?? quoteData.gasPrice ?? undefined,
     };
 
     if (!tx.to || !tx.data) {
@@ -139,7 +150,7 @@ app.post("/swap", async (req, res) => {
       });
     }
 
-    // 프런트 코드: const tx = swapRes;  로 바로 사용 가능하게
+    // 프런트: const tx = swapRes.tx; 로 사용
     res.json({ tx });
   } catch (err) {
     console.error("[/swap] error", err.status, err.details || err.message);
@@ -154,4 +165,3 @@ app.post("/swap", async (req, res) => {
 app.listen(PORT, () => {
   console.log(`G-DEX backend listening on port ${PORT}`);
 });
-
