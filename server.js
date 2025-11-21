@@ -105,19 +105,19 @@ app.post("/quote", async (req, res) => {
 app.post("/swap", async (req, res) => {
   try {
     const params = buildParams(req.body);
-    // intentOnFilling=true 추가
     params.set("intentOnFilling", "true");
 
     const url = `${ZEROX_BASE}/swap/allowance-holder/quote?${params.toString()}`;
     const quoteData = await call0x(url);
 
-    // 0x v2 allowance-holder 응답에서는 tx 정보가 transaction 안에 들어있음
-    const txSrc = quoteData.transaction || {};
+    // 0x v2 응답: transaction.to / transaction.data 안에 트랜잭션 정보
+    const rawTx = quoteData.transaction || {};
 
     const tx = {
-      to: txSrc.to,
-      data: txSrc.data,
-      value: txSrc.value || "0",
+      to: rawTx.to,
+      data: rawTx.data,
+      // value는 transaction.value 또는 top-level value 사용, 없으면 "0"
+      value: rawTx.value ?? quoteData.value ?? "0",
     };
 
     if (!tx.to || !tx.data) {
@@ -128,7 +128,6 @@ app.post("/swap", async (req, res) => {
       });
     }
 
-    // 프론트는 res.tx.to / res.tx.data / res.tx.value 를 사용
     res.json({ tx });
   } catch (err) {
     console.error("[/swap] error", err.status, err.details || err.message);
@@ -140,8 +139,10 @@ app.post("/swap", async (req, res) => {
 });
 
 
+
 // 서버 시작
 app.listen(PORT, () => {
   console.log(`G-DEX backend listening on port ${PORT}`);
 });
+
 
