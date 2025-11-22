@@ -47,7 +47,7 @@ const ZEROX_BASE = "https://api.0x.org";
 // ✅ 수수료(인티그레이터 fee) 설정
 // - FEE_RECIPIENT: 수수료를 받을 지갑 주소
 // - FEE_PERCENTAGE: buyToken 기준 퍼센트 (예: 0.001 = 0.1%, 0.01 = 1%)
-const FEE_RECIPIENT = "0xd840b263bed70c8ef3728ddcae64d482e7fdd513";
+const FEE_RECIPIENT = "0x932bf0a8746c041c00131640123fa6c847835d6f";
 const FEE_PERCENTAGE = 0.001; // 0.1% 수수료 — 필요시 숫자만 변경
 
 // 0x ETH sentinel
@@ -222,3 +222,4 @@ app.post("/swap", async (req, res) => {
 app.listen(PORT, () => {
   console.log(`G-DEX backend listening on port ${PORT}`);
 });
+
