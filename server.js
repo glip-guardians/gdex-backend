@@ -1,67 +1,71 @@
-// server.js  — G-DEX backend (0x v2 allowance-holder API, single-unit-conversion + feeRecipient)
+// server.js — G-DEX backend (0x v2 allowance-holder) + (optional) RPC gas estimation
 
-// Node 18+ 에서는 fetch 가 글로벌로 존재합니다.
 const express = require("express");
-const cors = require("cors");
-const bodyParser = require("body-parser");
 
 const app = express();
+app.use(express.json({ limit: "1mb" }));
 
-// ------------------------
-// CORS 허용 도메인
-// ------------------------
-const allowedOrigins = [
+/* =========================
+   CORS (화이트리스트만 허용)
+   ========================= */
+const allowedOrigins = new Set([
   "https://gdex-app.com",
   "https://www.gdex-app.com",
-  "https://glip-guardians.github.io"
-];
+  "https://glip-guardians.github.io",
+]);
 
 app.use((req, res, next) => {
   const origin = req.headers.origin;
-
-  if (allowedOrigins.includes(origin)) {
+  if (origin && allowedOrigins.has(origin)) {
     res.header("Access-Control-Allow-Origin", origin);
+    res.header("Vary", "Origin");
+    res.header("Access-Control-Allow-Credentials", "true");
   }
 
   res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.header("Access-Control-Allow-Headers", "Content-Type, 0x-api-key");
-  res.header("Access-Control-Allow-Credentials", "true");
 
-  if (req.method === "OPTIONS") {
-    return res.sendStatus(200);
-  }
-
+  if (req.method === "OPTIONS") return res.sendStatus(200);
   next();
 });
 
-app.use(cors());
-app.use(bodyParser.json());
-
-// ------------------------
-// 환경변수 & 상수
-// ------------------------
+/* =========================
+   ENV & CONST
+   ========================= */
 const PORT = process.env.PORT || 8080;
+
 const ZEROX_API_KEY = process.env.ZEROX_API_KEY;
 const ZEROX_BASE = "https://api.0x.org";
 
-// ✅ 수수료(인티그레이터 fee) 설정
-// - FEE_RECIPIENT: 수수료를 받을 지갑 주소
-// - FEE_PERCENTAGE: buyToken 기준 퍼센트 (예: 0.001 = 0.1%, 0.01 = 1%)
-const FEE_RECIPIENT = "0x932bf0a8746c041c00131640123fa6c847835d6f";
-const FEE_PERCENTAGE = 0.001; // 0.1% 수수료 — 필요시 숫자만 변경
+// ✅ 선택: RPC 넣으면 실패율 크게 내려감(estimateGas/fee 계산)
+const RPC_URL = process.env.RPC_URL || ""; // 예: https://eth-mainnet.g.alchemy.com/v2/xxx
 
-// 0x ETH sentinel
+// 수수료(인티그레이터 fee)
+const FEE_RECIPIENT = "0x932bf0a8746c041c00131640123fa6c847835d6f";
+const FEE_PERCENTAGE = 0.001; // 0.1%
+
 const ETH_SENTINEL = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE";
 
-if (!ZEROX_API_KEY) {
-  console.warn("[WARN] ZEROX_API_KEY is not set in environment variables.");
+if (!ZEROX_API_KEY) console.warn("[WARN] ZEROX_API_KEY is not set.");
+if (!RPC_URL) console.warn("[WARN] RPC_URL is not set. Gas estimation will be skipped.");
+
+/* =========================
+   Helpers
+   ========================= */
+function isHexAddress(a) {
+  return typeof a === "string" && /^0x[a-fA-F0-9]{40}$/.test(a);
 }
 
-/* --------------------------------------------------------
- * 공통: 0x 호출 헬퍼
- *  - 백엔드는 단위 변환을 하지 않고, 프런트에서 넘겨준
- *    값(이미 wei)을 그대로 0x에 전달만 한다.
- * ------------------------------------------------------*/
+function mustBeUintString(x) {
+  // 0x에 넘길 sellAmount는 "정수 문자열(wei)" 이어야 안정적
+  return typeof x === "string" && /^[0-9]+$/.test(x);
+}
+
+function clampNumber(n, min, max) {
+  if (Number.isNaN(n)) return min;
+  return Math.min(max, Math.max(min, n));
+}
+
 async function call0x(url) {
   console.log("[0x request]:", url);
 
@@ -69,19 +73,15 @@ async function call0x(url) {
     method: "GET",
     headers: {
       "Content-Type": "application/json",
-      "0x-api-key": ZEROX_API_KEY,
-      "0x-version": "v2", // allowance-holder v2 요구 헤더
+      "0x-api-key": ZEROX_API_KEY || "",
+      "0x-version": "v2",
     },
   });
 
   const text = await res.text();
   let data = {};
-  try {
-    data = text ? JSON.parse(text) : {};
-  } catch (e) {
-    console.error("[0x parse error]", e);
-    data = { raw: text };
-  }
+  try { data = text ? JSON.parse(text) : {}; }
+  catch { data = { raw: text }; }
 
   if (!res.ok) {
     console.error("[0x error]", res.status, data);
@@ -90,42 +90,29 @@ async function call0x(url) {
     err.details = data;
     throw err;
   }
-
   return data;
 }
 
-/* --------------------------------------------------------
- * 헬퍼: 기본 쿼리 파라미터 구성
- *  - sellAmount 는 프런트에서 이미 10^decimals 로
- *    스케일링된 "wei 문자열" 이라고 가정한다.
- *  - 여기서는 절대 추가 변환을 하지 않는다.
- *  - ✅ 여기에서 feeRecipient / buyTokenPercentageFee 추가
- * ------------------------------------------------------*/
 function buildParams(body) {
-  const chainId = body.chainId || 1; // Ethereum 메인넷
-  const { sellToken, buyToken, sellAmount, taker, slippagePercentage } = body;
+  const chainId = body.chainId || 1; // mainnet default
+  const { sellToken, buyToken, sellAmount, taker } = body;
+
+  // slippagePercentage: 프런트는 0.02(=2%) 형태로 전달
+  const slip = typeof body.slippagePercentage === "number" ? body.slippagePercentage : 0.02;
+  const safeSlip = clampNumber(slip, 0, 0.2); // 0% ~ 20% 제한
+  const slippageBps = Math.round(safeSlip * 10000);
 
   const params = new URLSearchParams({
     chainId: String(chainId),
     sellToken,
     buyToken,
-    sellAmount: String(sellAmount), // 방어적으로 문자열로 캐스팅
+    sellAmount: String(sellAmount),
+    slippageBps: String(slippageBps),
   });
 
-  if (taker) {
-    params.set("taker", taker);
-  }
+  if (taker) params.set("taker", taker);
 
-  // slippagePercentage(예: 0.02) → slippageBps(예: 200)
-  const slip =
-    typeof slippagePercentage === "number" ? slippagePercentage : 0.02;
-  const slippageBps = Math.round(slip * 10000);
-  params.set("slippageBps", String(slippageBps));
-
-  // ✅ 0x 수수료 파라미터 추가
-  // - feeRecipient: 수수료를 받을 주소
-  // - buyTokenPercentageFee: 수수료 비율 (소수, 예: 0.001 = 0.1%)
-  //   price / quote 둘 다 동일하게 붙여야 미리보기/실제 체결이 일치
+  // fee: price/quote 모두 동일하게 붙여야 preview/체결 불일치가 없음
   if (FEE_RECIPIENT && FEE_PERCENTAGE > 0) {
     params.set("feeRecipient", FEE_RECIPIENT);
     params.set("buyTokenPercentageFee", String(FEE_PERCENTAGE));
@@ -134,23 +121,93 @@ function buildParams(body) {
   return params;
 }
 
-/* ==========================  라우트  ========================== */
+/* =========================
+   Optional JSON-RPC helpers
+   ========================= */
+let rpcId = 1;
+async function rpc(method, params) {
+  if (!RPC_URL) throw new Error("RPC_URL not set");
+  const res = await fetch(RPC_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: rpcId++, method, params }),
+  });
+  const json = await res.json();
+  if (json.error) throw new Error(json.error.message || "RPC error");
+  return json.result;
+}
 
-// 헬스체크
-app.get("/", (req, res) => {
-  res.send("G-DEX backend is running.");
-});
+function toHex(nBigInt) {
+  return "0x" + nBigInt.toString(16);
+}
 
-// 가격 미리보기 /quote (Swap 입력 시 자동계산)
+function bnFromHex(hex) {
+  return BigInt(hex);
+}
+
+/* EIP-1559 fee 추천값(간단 버전)
+   - latest baseFee + tip(eth_maxPriorityFeePerGas) 기반
+*/
+async function suggestEip1559Fees() {
+  const block = await rpc("eth_getBlockByNumber", ["latest", false]);
+  const baseFee = block && block.baseFeePerGas ? bnFromHex(block.baseFeePerGas) : 0n;
+
+  let tip = 1500000000n; // 1.5 gwei fallback
+  try {
+    const tipHex = await rpc("eth_maxPriorityFeePerGas", []);
+    tip = bnFromHex(tipHex);
+  } catch {}
+
+  // maxFee = baseFee*2 + tip (보수적)
+  const maxFee = baseFee * 2n + tip;
+  return {
+    maxPriorityFeePerGas: toHex(tip),
+    maxFeePerGas: toHex(maxFee),
+  };
+}
+
+async function estimateGasWithBuffer(tx) {
+  const gasHex = await rpc("eth_estimateGas", [tx]);
+  const gas = bnFromHex(gasHex);
+  // 20% 버퍼
+  const buffered = gas + (gas / 5n);
+  return toHex(buffered);
+}
+
+/* =========================
+   Routes
+   ========================= */
+app.get("/", (req, res) => res.send("G-DEX backend is running."));
+
+/* /quote — price preview */
 app.post("/quote", async (req, res) => {
   try {
-    const params = buildParams(req.body);
+    const b = req.body || {};
+    const { sellToken, buyToken, sellAmount } = b;
 
-    // allowance-holder price 엔드포인트 (수수료 포함된 가격)
+    if (!sellToken || !buyToken || sellAmount == null) {
+      return res.status(400).json({ message: "Missing sellToken/buyToken/sellAmount" });
+    }
+    if (sellToken !== ETH_SENTINEL && sellToken !== "ETH" && !isHexAddress(sellToken)) {
+      return res.status(400).json({ message: "Invalid sellToken address" });
+    }
+    if (buyToken !== ETH_SENTINEL && buyToken !== "ETH" && !isHexAddress(buyToken)) {
+      return res.status(400).json({ message: "Invalid buyToken address" });
+    }
+    if (!mustBeUintString(String(sellAmount))) {
+      return res.status(400).json({ message: "sellAmount must be an integer string (wei)" });
+    }
+
+    const params = buildParams({
+      ...b,
+      sellToken: sellToken === "ETH" ? ETH_SENTINEL : sellToken,
+      buyToken: buyToken === "ETH" ? ETH_SENTINEL : buyToken,
+      sellAmount: String(sellAmount),
+    });
+
     const url = `${ZEROX_BASE}/swap/allowance-holder/price?${params.toString()}`;
     const priceData = await call0x(url);
 
-    // 프런트에서 buyAmount, price 등 바로 사용 가능
     res.json(priceData);
   } catch (err) {
     console.error("[/quote] error", err.status, err.details || err.message);
@@ -161,53 +218,91 @@ app.post("/quote", async (req, res) => {
   }
 });
 
-// 실제 스왑 /swap (Swap 버튼 클릭 시)
+/* /swap — build tx */
 app.post("/swap", async (req, res) => {
   try {
-    const params = buildParams(req.body);
+    const b = req.body || {};
+    const { sellToken, buyToken, sellAmount, taker } = b;
+
+    if (!sellToken || !buyToken || !sellAmount || !taker) {
+      return res.status(400).json({ message: "Missing sellToken/buyToken/sellAmount/taker" });
+    }
+    if (!isHexAddress(taker)) {
+      return res.status(400).json({ message: "Invalid taker address" });
+    }
+    if (!mustBeUintString(String(sellAmount))) {
+      return res.status(400).json({ message: "sellAmount must be an integer string (wei)" });
+    }
+
+    const normalizedSell = sellToken === "ETH" ? ETH_SENTINEL : sellToken;
+    const normalizedBuy  = buyToken === "ETH" ? ETH_SENTINEL : buyToken;
+
+    const params = buildParams({
+      ...b,
+      sellToken: normalizedSell,
+      buyToken: normalizedBuy,
+      sellAmount: String(sellAmount),
+    });
+
+    // ✅ intentOnFilling=true 는 allowance-holder에서 권장
     params.set("intentOnFilling", "true");
 
-    // allowance-holder quote 엔드포인트 (tx 생성, 수수료 포함)
     const url = `${ZEROX_BASE}/swap/allowance-holder/quote?${params.toString()}`;
     const quoteData = await call0x(url);
 
-    // 0x v2 응답: transaction 안에 트랜잭션 세부 정보
     const rawTx = quoteData.transaction || {};
+    if (!rawTx.to || !rawTx.data) {
+      return res.status(500).json({ message: "0x quote did not return tx fields", raw: quoteData });
+    }
 
-    // ====== 우리가 보낼 tx 구성 ======
-    // 1) to, data는 0x 것을 그대로 사용
+    // ====== base tx (metamask용) ======
+    // NOTE: 프런트가 decimal-string value를 hex로 변환하므로 value는 string 유지
     const tx = {
       to: rawTx.to,
       data: rawTx.data,
+      value: "0",
     };
 
-    // 2) ETH를 파는 경우(sellToken = ETH sentinel)에는
-    //    사용자가 입력한 sellAmount(wei)를 그대로 value 로 사용
-    if (req.body.sellToken === ETH_SENTINEL) {
-      tx.value = String(req.body.sellAmount); // 예: 0.0023 ETH → 2300000000000000
+    // ETH sell이면 value는 sellAmount
+    if (normalizedSell === ETH_SENTINEL) {
+      tx.value = String(sellAmount);
     } else {
-      // ERC-20 → 어떤 토큰 스왑: 일반적으로 value = 0 이어야 함
-      // 혹시 0x가 fee 등으로 value 를 요구하면 그대로 따라가고,
-      // 둘 다 없으면 "0"
-      tx.value = rawTx.value ?? quoteData.value ?? "0";
+      // ERC20 sell은 보통 value=0
+      tx.value = rawTx.value != null ? String(rawTx.value) : "0";
     }
 
-    // ✅ gas / gasPrice 는 MetaMask 에게 맡김 (0x에서 온 값을 강제하지 않음)
-    // 필요하면 아래를 다시 활성화
-    // if (rawTx.gas != null)      tx.gas      = rawTx.gas;
-    // if (rawTx.gasPrice != null) tx.gasPrice = rawTx.gasPrice;
+    // ✅ (중요) 가능하면 gas / EIP-1559 fee까지 포함해서 프런트로 전달
+    // 프런트가 이를 txParams에 넣어주면 실패율이 확 내려감
+    // 0x가 gas를 줄 때도 있고, 없을 수도 있음 → 없으면 RPC로 estimate
+    if (rawTx.gas != null) tx.gas = String(rawTx.gas);
 
-    if (!tx.to || !tx.data) {
-      console.error("[/swap] missing tx fields in 0x response", quoteData);
-      return res.status(500).json({
-        message: "0x quote did not return tx fields",
-        raw: quoteData,
-      });
+    // RPC가 있으면 estimateGas + fee 추천
+    if (RPC_URL) {
+      // estimateGas를 하려면 from 필요 (taker)
+      const estTx = {
+        from: taker,
+        to: tx.to,
+        data: tx.data,
+        value: tx.value === "0" ? "0x0" : toHex(BigInt(tx.value)),
+      };
+
+      try {
+        const gasHex = await estimateGasWithBuffer(estTx);
+        tx.gas = gasHex; // ✅ hex로 내려줌(메타마스크 호환)
+      } catch (e) {
+        console.warn("[swap] estimateGas failed, fallback to 0x gas if any", e.message || e);
+      }
+
+      try {
+        const fees = await suggestEip1559Fees();
+        tx.maxFeePerGas = fees.maxFeePerGas;
+        tx.maxPriorityFeePerGas = fees.maxPriorityFeePerGas;
+      } catch (e) {
+        console.warn("[swap] fee suggestion failed", e.message || e);
+      }
     }
 
-    console.log("[/swap] final tx sent to frontend:", tx);
-
-    // 프런트: const tx = swapRes.tx || swapRes;
+    console.log("[/swap] tx -> frontend:", tx);
     res.json({ tx });
   } catch (err) {
     console.error("[/swap] error", err.status, err.details || err.message);
@@ -218,8 +313,4 @@ app.post("/swap", async (req, res) => {
   }
 });
 
-// 서버 시작
-app.listen(PORT, () => {
-  console.log(`G-DEX backend listening on port ${PORT}`);
-});
-
+app.listen(PORT, () => console.log(`G-DEX backend listening on port ${PORT}`));
