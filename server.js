@@ -314,3 +314,146 @@ app.post("/swap", async (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`G-DEX backend listening on port ${PORT}`));
+
+// ==============================
+// Sushi Pools Proxy API (GraphQL)
+// GET /sushi/pools?chain=ethereum&limit=5
+// ==============================
+const SUSHI_SUBGRAPH_URL = process.env.SUSHI_SUBGRAPH_URL;
+
+// 간단 캐시(서버 메모리) — 60초
+const __sushiCache = new Map(); // key: chain|limit  value: { ts, data }
+const SUSHI_CACHE_TTL_MS = 60 * 1000;
+
+function safeNum(n, fallback = 0) {
+  const x = Number(n);
+  return Number.isFinite(x) ? x : fallback;
+}
+
+function formatUsdCompact(v) {
+  const n = safeNum(v, 0);
+  if (n >= 1e9) return `$${(n / 1e9).toFixed(2)}b`;
+  if (n >= 1e6) return `$${(n / 1e6).toFixed(2)}m`;
+  if (n >= 1e3) return `$${(n / 1e3).toFixed(2)}k`;
+  return `$${n.toFixed(2)}`;
+}
+
+/**
+ * NOTE:
+ * 서브그래프 스키마는 제공처/버전에 따라 달라질 수 있습니다.
+ * 아래 쿼리는 "풀 리스트 + TVL/fee"를 가져오려고 시도합니다.
+ * 만약 스키마가 다르면, 아래 query에서 필드명만 제공처에 맞게 바꾸면 됩니다.
+ */
+async function fetchSushiPoolsFromGraphql({ chain = "ethereum", limit = 5 }) {
+  if (!SUSHI_SUBGRAPH_URL) {
+    throw new Error("SUSHI_SUBGRAPH_URL env is missing");
+  }
+
+  // 가장 흔히 쓰는 형태를 우선 시도 (필드명은 환경에 따라 조정 필요)
+  const query = `
+    query Pools($first:Int!) {
+      pools: pairs(first: $first, orderBy: createdAtTimestamp, orderDirection: desc) {
+        id
+        createdAtTimestamp
+        token0 { symbol }
+        token1 { symbol }
+        reserveUSD
+        volumeUSD
+        swapFee
+      }
+    }
+  `;
+
+  const body = JSON.stringify({
+    query,
+    variables: { first: Math.max(1, Math.min(20, Number(limit) || 5)) },
+  });
+
+  const r = await fetch(SUSHI_SUBGRAPH_URL, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body,
+  });
+
+  if (!r.ok) {
+    const t = await r.text().catch(() => "");
+    throw new Error(`GraphQL HTTP ${r.status}: ${t.slice(0, 200)}`);
+  }
+
+  const json = await r.json();
+
+  // GraphQL 에러 처리
+  if (json.errors?.length) {
+    throw new Error(`GraphQL errors: ${json.errors.map(e => e.message).join(" | ")}`);
+  }
+
+  const pools = (json.data?.pools || []).map((p) => {
+    const t0 = p?.token0?.symbol || "?";
+    const t1 = p?.token1?.symbol || "?";
+    const name = `${t0} / ${t1}`;
+
+    // TVL/Volume 필드는 환경마다 이름이 다를 수 있어 fallback 처리
+    const tvlUsd = safeNum(p.reserveUSD ?? p.tvlUSD ?? p.totalValueLockedUSD ?? 0, 0);
+    const volUsd = safeNum(p.volumeUSD ?? p.volumeUSD24h ?? 0, 0);
+
+    // fee도 제공처에 따라 없을 수 있음
+    // swapFee가 0.003 형태(=0.3%)일 수도, 0.3(=0.3%)일 수도 있어 보정
+    let fee = p.swapFee;
+    let feePct = null;
+    if (fee != null) {
+      const f = safeNum(fee, NaN);
+      if (Number.isFinite(f)) {
+        // 0.003 -> 0.3%
+        feePct = (f <= 0.05) ? (f * 100) : f;
+      }
+    }
+
+    return {
+      id: p.id,
+      name,
+      tvlUsd,
+      tvlText: formatUsdCompact(tvlUsd),
+      volumeUsd: volUsd,
+      feePct, // number | null
+      // 클릭 시 sushi로 보낼 수 있게 id 포함 (필요하면 프런트에서 사용)
+      url: `https://www.sushi.com/ethereum/pool/${p.id}`,
+    };
+  });
+
+  return pools;
+}
+
+app.get("/sushi/pools", async (req, res) => {
+  try {
+    const chain = String(req.query.chain || "ethereum").toLowerCase();
+    const limit = Math.max(1, Math.min(10, Number(req.query.limit || 5)));
+
+    const cacheKey = `${chain}|${limit}`;
+    const cached = __sushiCache.get(cacheKey);
+    const now = Date.now();
+
+    if (cached && (now - cached.ts) < SUSHI_CACHE_TTL_MS) {
+      return res.json({ ok: true, chain, cached: true, items: cached.data });
+    }
+
+    const items = await fetchSushiPoolsFromGraphql({ chain, limit });
+
+    __sushiCache.set(cacheKey, { ts: now, data: items });
+    return res.json({ ok: true, chain, cached: false, items });
+  } catch (e) {
+    console.error("[/sushi/pools] error:", e?.message || e);
+
+    // 프런트가 깨지지 않도록 “안전한 폴백” 제공
+    return res.status(200).json({
+      ok: false,
+      error: String(e?.message || e),
+      items: [
+        { id: "0x0", name: "WBTC / ETH", tvlText: "$—", feePct: 0.3, url: "https://www.sushi.com/ethereum/explore/pools" },
+        { id: "0x0", name: "DAI / ETH",  tvlText: "$—", feePct: 0.3, url: "https://www.sushi.com/ethereum/explore/pools" },
+        { id: "0x0", name: "USDC / ETH", tvlText: "$—", feePct: 0.3, url: "https://www.sushi.com/ethereum/explore/pools" },
+        { id: "0x0", name: "SUSHI / ETH",tvlText: "$—", feePct: 0.3, url: "https://www.sushi.com/ethereum/explore/pools" },
+        { id: "0x0", name: "LINK / ETH", tvlText: "$—", feePct: 0.3, url: "https://www.sushi.com/ethereum/explore/pools" },
+      ],
+    });
+  }
+});
