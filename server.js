@@ -1,9 +1,24 @@
 // server.js — G-DEX backend (0x v2 allowance-holder) + (optional) RPC gas estimation
+// + Sushi pools proxy (GraphQL)
+//
+// ✅ Hardening changes:
+// - Safe fetch() fallback (Node <18 대비)
+// - /swap tx fields: gas/value 가능한 한 HEX로 통일
+// - app.listen moved to bottom
+// - CORS headers slightly expanded
 
 const express = require("express");
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
+
+/* =========================
+   fetch polyfill (safe)
+   ========================= */
+const fetchFn =
+  typeof global.fetch === "function"
+    ? global.fetch.bind(global)
+    : (...args) => import("node-fetch").then(({ default: f }) => f(...args));
 
 /* =========================
    CORS (화이트리스트만 허용)
@@ -16,6 +31,7 @@ const allowedOrigins = new Set([
 
 app.use((req, res, next) => {
   const origin = req.headers.origin;
+
   if (origin && allowedOrigins.has(origin)) {
     res.header("Access-Control-Allow-Origin", origin);
     res.header("Vary", "Origin");
@@ -23,7 +39,11 @@ app.use((req, res, next) => {
   }
 
   res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.header("Access-Control-Allow-Headers", "Content-Type, 0x-api-key");
+  // ✅ 프런트/프록시에서 헤더가 추가될 수 있어 여유 있게 허용
+  res.header(
+    "Access-Control-Allow-Headers",
+    "Content-Type, 0x-api-key, Authorization, Accept"
+  );
 
   if (req.method === "OPTIONS") return res.sendStatus(200);
   next();
@@ -69,7 +89,7 @@ function clampNumber(n, min, max) {
 async function call0x(url) {
   console.log("[0x request]:", url);
 
-  const res = await fetch(url, {
+  const res = await fetchFn(url, {
     method: "GET",
     headers: {
       "Content-Type": "application/json",
@@ -80,8 +100,11 @@ async function call0x(url) {
 
   const text = await res.text();
   let data = {};
-  try { data = text ? JSON.parse(text) : {}; }
-  catch { data = { raw: text }; }
+  try {
+    data = text ? JSON.parse(text) : {};
+  } catch {
+    data = { raw: text };
+  }
 
   if (!res.ok) {
     console.error("[0x error]", res.status, data);
@@ -97,8 +120,9 @@ function buildParams(body) {
   const chainId = body.chainId || 1; // mainnet default
   const { sellToken, buyToken, sellAmount, taker } = body;
 
-  // slippagePercentage: 프런트는 0.02(=2%) 형태로 전달
-  const slip = typeof body.slippagePercentage === "number" ? body.slippagePercentage : 0.02;
+  // slippagePercentage: 프런트는 0.02(=2%) 형태로 전달 가정
+  const slip =
+    typeof body.slippagePercentage === "number" ? body.slippagePercentage : 0.02;
   const safeSlip = clampNumber(slip, 0, 0.2); // 0% ~ 20% 제한
   const slippageBps = Math.round(safeSlip * 10000);
 
@@ -127,7 +151,7 @@ function buildParams(body) {
 let rpcId = 1;
 async function rpc(method, params) {
   if (!RPC_URL) throw new Error("RPC_URL not set");
-  const res = await fetch(RPC_URL, {
+  const res = await fetchFn(RPC_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ jsonrpc: "2.0", id: rpcId++, method, params }),
@@ -170,8 +194,28 @@ async function estimateGasWithBuffer(tx) {
   const gasHex = await rpc("eth_estimateGas", [tx]);
   const gas = bnFromHex(gasHex);
   // 20% 버퍼
-  const buffered = gas + (gas / 5n);
+  const buffered = gas + gas / 5n;
   return toHex(buffered);
+}
+
+// ✅ decimal-string -> hex (메타마스크/eth_sendTransaction 호환)
+function decStringToHex(decStr) {
+  try {
+    const n = BigInt(String(decStr || "0"));
+    return toHex(n);
+  } catch {
+    return "0x0";
+  }
+}
+
+// ✅ gas는 hex로 내려주는 편이 안전
+function normalizeGasField(g) {
+  if (g == null) return null;
+  const s = String(g);
+  if (s.startsWith("0x")) return s;
+  // decimal -> hex
+  if (/^[0-9]+$/.test(s)) return toHex(BigInt(s));
+  return null;
 }
 
 /* =========================
@@ -255,40 +299,38 @@ app.post("/swap", async (req, res) => {
       return res.status(500).json({ message: "0x quote did not return tx fields", raw: quoteData });
     }
 
-    // ====== base tx (metamask용) ======
-    // NOTE: 프런트가 decimal-string value를 hex로 변환하므로 value는 string 유지
+    // ====== base tx (메타마스크용) ======
+    // ✅ value/gas는 가능하면 HEX로 통일해서 내림
     const tx = {
       to: rawTx.to,
       data: rawTx.data,
-      value: "0",
+      value: "0x0",
     };
 
     // ETH sell이면 value는 sellAmount
     if (normalizedSell === ETH_SENTINEL) {
-      tx.value = String(sellAmount);
+      tx.value = decStringToHex(String(sellAmount));
     } else {
       // ERC20 sell은 보통 value=0
-      tx.value = rawTx.value != null ? String(rawTx.value) : "0";
+      tx.value = rawTx.value != null ? (String(rawTx.value).startsWith("0x") ? String(rawTx.value) : decStringToHex(String(rawTx.value))) : "0x0";
     }
 
-    // ✅ (중요) 가능하면 gas / EIP-1559 fee까지 포함해서 프런트로 전달
-    // 프런트가 이를 txParams에 넣어주면 실패율이 확 내려감
-    // 0x가 gas를 줄 때도 있고, 없을 수도 있음 → 없으면 RPC로 estimate
-    if (rawTx.gas != null) tx.gas = String(rawTx.gas);
+    // 0x가 gas를 줄 때도 있고 없을 수도 → 있으면 normalize
+    const maybeGas = normalizeGasField(rawTx.gas);
+    if (maybeGas) tx.gas = maybeGas;
 
     // RPC가 있으면 estimateGas + fee 추천
     if (RPC_URL) {
-      // estimateGas를 하려면 from 필요 (taker)
       const estTx = {
         from: taker,
         to: tx.to,
         data: tx.data,
-        value: tx.value === "0" ? "0x0" : toHex(BigInt(tx.value)),
+        value: tx.value,
       };
 
       try {
         const gasHex = await estimateGasWithBuffer(estTx);
-        tx.gas = gasHex; // ✅ hex로 내려줌(메타마스크 호환)
+        tx.gas = gasHex; // ✅ hex
       } catch (e) {
         console.warn("[swap] estimateGas failed, fallback to 0x gas if any", e.message || e);
       }
@@ -312,8 +354,6 @@ app.post("/swap", async (req, res) => {
     });
   }
 });
-
-app.listen(PORT, () => console.log(`G-DEX backend listening on port ${PORT}`));
 
 // ==============================
 // Sushi Pools Proxy API (GraphQL)
@@ -341,15 +381,12 @@ function formatUsdCompact(v) {
 /**
  * NOTE:
  * 서브그래프 스키마는 제공처/버전에 따라 달라질 수 있습니다.
- * 아래 쿼리는 "풀 리스트 + TVL/fee"를 가져오려고 시도합니다.
- * 만약 스키마가 다르면, 아래 query에서 필드명만 제공처에 맞게 바꾸면 됩니다.
  */
 async function fetchSushiPoolsFromGraphql({ chain = "ethereum", limit = 5 }) {
   if (!SUSHI_SUBGRAPH_URL) {
     throw new Error("SUSHI_SUBGRAPH_URL env is missing");
   }
 
-  // 가장 흔히 쓰는 형태를 우선 시도 (필드명은 환경에 따라 조정 필요)
   const query = `
     query Pools($first:Int!) {
       pools: pairs(first: $first, orderBy: createdAtTimestamp, orderDirection: desc) {
@@ -369,7 +406,7 @@ async function fetchSushiPoolsFromGraphql({ chain = "ethereum", limit = 5 }) {
     variables: { first: Math.max(1, Math.min(20, Number(limit) || 5)) },
   });
 
-  const r = await fetch(SUSHI_SUBGRAPH_URL, {
+  const r = await fetchFn(SUSHI_SUBGRAPH_URL, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body,
@@ -381,10 +418,8 @@ async function fetchSushiPoolsFromGraphql({ chain = "ethereum", limit = 5 }) {
   }
 
   const json = await r.json();
-
-  // GraphQL 에러 처리
   if (json.errors?.length) {
-    throw new Error(`GraphQL errors: ${json.errors.map(e => e.message).join(" | ")}`);
+    throw new Error(`GraphQL errors: ${json.errors.map((e) => e.message).join(" | ")}`);
   }
 
   const pools = (json.data?.pools || []).map((p) => {
@@ -392,20 +427,13 @@ async function fetchSushiPoolsFromGraphql({ chain = "ethereum", limit = 5 }) {
     const t1 = p?.token1?.symbol || "?";
     const name = `${t0} / ${t1}`;
 
-    // TVL/Volume 필드는 환경마다 이름이 다를 수 있어 fallback 처리
     const tvlUsd = safeNum(p.reserveUSD ?? p.tvlUSD ?? p.totalValueLockedUSD ?? 0, 0);
     const volUsd = safeNum(p.volumeUSD ?? p.volumeUSD24h ?? 0, 0);
 
-    // fee도 제공처에 따라 없을 수 있음
-    // swapFee가 0.003 형태(=0.3%)일 수도, 0.3(=0.3%)일 수도 있어 보정
-    let fee = p.swapFee;
     let feePct = null;
-    if (fee != null) {
-      const f = safeNum(fee, NaN);
-      if (Number.isFinite(f)) {
-        // 0.003 -> 0.3%
-        feePct = (f <= 0.05) ? (f * 100) : f;
-      }
+    if (p.swapFee != null) {
+      const f = safeNum(p.swapFee, NaN);
+      if (Number.isFinite(f)) feePct = f <= 0.05 ? f * 100 : f;
     }
 
     return {
@@ -414,8 +442,7 @@ async function fetchSushiPoolsFromGraphql({ chain = "ethereum", limit = 5 }) {
       tvlUsd,
       tvlText: formatUsdCompact(tvlUsd),
       volumeUsd: volUsd,
-      feePct, // number | null
-      // 클릭 시 sushi로 보낼 수 있게 id 포함 (필요하면 프런트에서 사용)
+      feePct,
       url: `https://www.sushi.com/ethereum/pool/${p.id}`,
     };
   });
@@ -432,18 +459,16 @@ app.get("/sushi/pools", async (req, res) => {
     const cached = __sushiCache.get(cacheKey);
     const now = Date.now();
 
-    if (cached && (now - cached.ts) < SUSHI_CACHE_TTL_MS) {
+    if (cached && now - cached.ts < SUSHI_CACHE_TTL_MS) {
       return res.json({ ok: true, chain, cached: true, items: cached.data });
     }
 
     const items = await fetchSushiPoolsFromGraphql({ chain, limit });
-
     __sushiCache.set(cacheKey, { ts: now, data: items });
     return res.json({ ok: true, chain, cached: false, items });
   } catch (e) {
     console.error("[/sushi/pools] error:", e?.message || e);
 
-    // 프런트가 깨지지 않도록 “안전한 폴백” 제공
     return res.status(200).json({
       ok: false,
       error: String(e?.message || e),
@@ -457,3 +482,8 @@ app.get("/sushi/pools", async (req, res) => {
     });
   }
 });
+
+/* =========================
+   Listen
+   ========================= */
+app.listen(PORT, () => console.log(`G-DEX backend listening on port ${PORT}`));
