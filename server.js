@@ -482,8 +482,138 @@ app.get("/sushi/pools", async (req, res) => {
     });
   }
 });
+/* =========================
+   📰 Crypto News Section (NEW)
+   - No extra packages required (Node 18+ fetch)
+   - Caches titles (default 10 min)
+   - Returns top 5 items for rolling UI
+   ========================= */
+
+const NEWS_SOURCES = [
+  { name: "CoinDesk",      url: "https://www.coindesk.com/arc/outboundfeeds/rss/?outputType=xml" }, // :contentReference[oaicite:3]{index=3}
+  { name: "Cointelegraph", url: "https://cointelegraph.com/rss" },                                   // :contentReference[oaicite:4]{index=4}
+  { name: "CryptoSlate",   url: "https://cryptoslate.com/feed/" },                                   // :contentReference[oaicite:5]{index=5}
+  { name: "CryptoNews",    url: "https://cryptonews.com/news/feed/" },                               // :contentReference[oaicite:6]{index=6}
+  { name: "CryptoPotato",  url: "https://cryptopotato.com/feed/" },                                  // :contentReference[oaicite:7]{index=7}
+];
+
+// in-memory cache
+let cryptoNewsCache = {
+  updatedAt: 0,
+  items: [], // [{ title, link, source }]
+  error: null
+};
+
+const NEWS_MAX_ITEMS = 5;              // 프런트 롤링 표시 5줄
+const NEWS_REFRESH_MS = 10 * 60 * 1000; // 10분마다 갱신 (원하면 5~15분으로 조절)
+
+// 아주 가벼운 RSS 파서(제목/링크만): 라이브러리 없이 정규식 기반
+function decodeXmlEntities(str = "") {
+  return str
+    .replace(/<!\[CDATA\[(.*?)\]\]>/g, "$1")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .trim();
+}
+
+function parseRss(xml, sourceName) {
+  const items = [];
+  if (!xml || typeof xml !== "string") return items;
+
+  // <item> ... </item> 추출
+  const itemBlocks = xml.match(/<item[\s\S]*?<\/item>/gi) || [];
+  for (const block of itemBlocks) {
+    const titleMatch = block.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+    const linkMatch  = block.match(/<link[^>]*>([\s\S]*?)<\/link>/i);
+
+    const title = titleMatch ? decodeXmlEntities(titleMatch[1]) : "";
+    const link  = linkMatch  ? decodeXmlEntities(linkMatch[1])  : "";
+
+    if (!title) continue;
+
+    items.push({
+      title,
+      link: link || null,
+      source: sourceName
+    });
+
+    if (items.length >= 10) break; // 소스별 상위 몇 개만
+  }
+  return items;
+}
+
+async function fetchOneRss(src) {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), 8000); // 8초 타임아웃
+  try {
+    const res = await fetch(src.url, {
+      method: "GET",
+      headers: {
+        "User-Agent": "G-DEX-NewsFetcher/1.0",
+        "Accept": "application/rss+xml, application/xml;q=0.9, */*;q=0.8"
+      },
+      signal: controller.signal
+    });
+    const text = await res.text();
+    return parseRss(text, src.name);
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+async function refreshCryptoNews() {
+  try {
+    const results = await Promise.allSettled(NEWS_SOURCES.map(fetchOneRss));
+    const merged = [];
+
+    for (const r of results) {
+      if (r.status === "fulfilled" && Array.isArray(r.value)) merged.push(...r.value);
+    }
+
+    // 중복 제거(제목 기준) + 정리
+    const seen = new Set();
+    const deduped = [];
+    for (const it of merged) {
+      const key = (it.title || "").toLowerCase();
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      deduped.push(it);
+      if (deduped.length >= NEWS_MAX_ITEMS) break;
+    }
+
+    cryptoNewsCache = {
+      updatedAt: Date.now(),
+      items: deduped,
+      error: null
+    };
+  } catch (e) {
+    cryptoNewsCache = {
+      updatedAt: Date.now(),
+      items: cryptoNewsCache.items || [],
+      error: (e && e.message) ? e.message : String(e)
+    };
+  }
+}
+
+// 서버 시작 시 1회 갱신 + 주기 갱신
+refreshCryptoNews().catch(()=>{});
+setInterval(() => refreshCryptoNews().catch(()=>{}), NEWS_REFRESH_MS);
+
+// ✅ 프런트에서 호출할 엔드포인트
+// GET /api/crypto-news -> { updatedAt, items:[{title,link,source}], error? }
+app.get("/api/crypto-news", (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  res.json(cryptoNewsCache);
+});
+/* =========================
+   📰 Crypto News Section End
+   ========================= */
 
 /* =========================
    Listen
    ========================= */
 app.listen(PORT, () => console.log(`G-DEX backend listening on port ${PORT}`));
+
