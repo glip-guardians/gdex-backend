@@ -391,15 +391,7 @@ function formatUsdCompact(v) {
  * - fields: id, createdAtTimestamp, token0{symbol}, token1{symbol}, reserveUSD, volumeUSD ...
  * - swapFee 같은 필드는 없음(스키마 mismatch 원인)
  */
-async function fetchSushiPoolsFromGraphql({ chain = "ethereum", limit = 5 }) {
-  if (!SUSHI_SUBGRAPH_URL) {
-    throw new Error("SUSHI_SUBGRAPH_URL env is missing");
-  }
-
-  // chain 파라미터는 향후 멀티체인 확장용으로만 받고,
-  // sushiswap/exchange는 사실상 Ethereum v2 페어 기준입니다.
-  const first = Math.max(1, Math.min(20, Number(limit) || 5));
-
+async function fetchSushiPoolsFromGraphql({ chain="ethereum", limit=5 }) {
   const query = `
     query Pools($first:Int!) {
       pools: pairs(first: $first, orderBy: createdAtTimestamp, orderDirection: desc) {
@@ -409,40 +401,21 @@ async function fetchSushiPoolsFromGraphql({ chain = "ethereum", limit = 5 }) {
         token1 { symbol }
         reserveUSD
         volumeUSD
+        swapFee
       }
     }
   `;
 
-  const body = JSON.stringify({ query, variables: { first } });
+  const first = 80; // ✅ 넉넉히 가져오기
+  ...
+  const mapped = (json.data?.pools || []).map(...);
 
-  const r = await fetchFn(SUSHI_SUBGRAPH_URL, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body,
-  });
+  // ✅ TVL 0 제거(원하면 기준을 1달러 이상으로 올려도 됨)
+  const nonZero = mapped.filter(p => safeNum(p.tvlUsd, 0) > 0);
 
-  if (!r.ok) {
-    const t = await r.text().catch(() => "");
-    throw new Error(`GraphQL HTTP ${r.status}: ${t.slice(0, 200)}`);
-  }
+  return nonZero.slice(0, limit);
+}
 
-  const json = await r.json();
-  if (json.errors?.length) {
-    throw new Error(
-      `GraphQL errors: ${json.errors.map((e) => e.message).join(" | ")}`
-    );
-  }
-
-  const poolsRaw = Array.isArray(json.data?.pools) ? json.data.pools : [];
-
-  const pools = poolsRaw.map((p) => {
-    const t0 = p?.token0?.symbol || "?";
-    const t1 = p?.token1?.symbol || "?";
-    const name = `${t0} / ${t1}`;
-
-    // TheGraph는 숫자를 문자열로 주는 경우가 많음 -> Number()로 변환 필요
-    const tvlUsd = safeNum(p.reserveUSD ?? 0, 0);
-    const volUsd = safeNum(p.volumeUSD ?? 0, 0);
 
     // V2는 보통 0.30% 표시(참고용)
     const feePct = 0.3;
@@ -630,5 +603,6 @@ app.get("/api/crypto-news", (req, res) => {
    Listen
    ========================= */
 app.listen(PORT, () => console.log(`G-DEX backend listening on port ${PORT}`));
+
 
 
