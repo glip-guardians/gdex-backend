@@ -511,7 +511,6 @@ app.get("/sushi/pools", async (req, res) => {
   }
 });
 
-
 /* =========================
    📰 Crypto News Section (NEW)
    - No extra packages required (Node 18+ fetch)
@@ -646,6 +645,7 @@ app.get("/api/crypto-news", (req, res) => {
    Listen
    ========================= */
 app.listen(PORT, () => console.log(`G-DEX backend listening on port ${PORT}`));
+
 
 
 
