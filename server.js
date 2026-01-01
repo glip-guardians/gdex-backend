@@ -374,11 +374,17 @@ function safeNum(n, fallback = 0) {
 
 function formatUsdCompact(v) {
   const n = safeNum(v, 0);
+
+  // ✅ 0 이하거나 너무 작으면 0.00 대신 "—"로
+  if (n <= 0) return "<$0";
+  if (n < 0.01) return "<$0.01";
+
   if (n >= 1e9) return `$${(n / 1e9).toFixed(2)}b`;
   if (n >= 1e6) return `$${(n / 1e6).toFixed(2)}m`;
   if (n >= 1e3) return `$${(n / 1e3).toFixed(2)}k`;
   return `$${n.toFixed(2)}`;
 }
+
 
 /**
  * ✅ sushiswap/exchange(=v2 스타일) 기준:
@@ -625,6 +631,7 @@ app.get("/api/crypto-news", (req, res) => {
    Listen
    ========================= */
 app.listen(PORT, () => console.log(`G-DEX backend listening on port ${PORT}`));
+
 
 
 
