@@ -380,150 +380,116 @@ function formatUsdCompact(v) {
   return `$${n.toFixed(2)}`;
 }
 
-function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }
-
 /**
- * V2 exchange 서브그래프(pairs) 기준 쿼리.
- * (현재 당신이 쓰는 reserveUSD/swapFee 필드 기준)
+ * ✅ sushiswap/exchange(=v2 스타일) 기준:
+ * pairs에는 reserveUSD/volumeUSD는 있지만 swapFee는 없음.
  */
 async function fetchSushiPoolsFromGraphql({ chain = "ethereum", limit = 5 }) {
   if (!SUSHI_SUBGRAPH_URL) throw new Error("SUSHI_SUBGRAPH_URL env is missing");
 
+  // NOTE: chain 파라미터는 지금은 URL만 단일 사용(ethereum 고정)로 두되,
+  // 추후 멀티체인 지원 시 여기서 URL을 체인별로 분기하세요.
+  const first = Math.max(1, Math.min(20, Number(limit) || 5));
+
   const query = `
-    query Pools($first:Int!) {
-      pools: pairs(first: $first, orderBy: createdAtTimestamp, orderDirection: desc) {
+    query Pairs($first:Int!) {
+      pairs(first: $first, orderBy: createdAtTimestamp, orderDirection: desc) {
         id
         createdAtTimestamp
         token0 { symbol }
         token1 { symbol }
         reserveUSD
         volumeUSD
-        swapFee
       }
     }
   `;
 
-  const first = Math.max(1, Math.min(20, Number(limit) || 5));
   const body = JSON.stringify({ query, variables: { first } });
 
   const r = await fetchFn(SUSHI_SUBGRAPH_URL, {
     method: "POST",
-    headers: {
-      "content-type": "application/json",
-      // 일부 게이트웨이는 UA 요구/권장
-      "user-agent": "G-DEX-SushiPools/1.0"
-    },
+    headers: { "content-type": "application/json" },
     body,
   });
 
-  if (!r.ok) {
-    const t = await r.text().catch(() => "");
-    throw new Error(`GraphQL HTTP ${r.status}: ${t.slice(0, 200)}`);
+  const text = await r.text().catch(() => "");
+  if (!r.ok) throw new Error(`GraphQL HTTP ${r.status}: ${text.slice(0, 200)}`);
+
+  let json;
+  try {
+    json = text ? JSON.parse(text) : {};
+  } catch {
+    throw new Error("GraphQL returned non-JSON response");
   }
 
-  const json = await r.json().catch(()=> ({}));
   if (json.errors?.length) {
-    throw new Error(`GraphQL errors: ${json.errors.map(e=>e.message).join(" | ")}`);
+    throw new Error(`GraphQL errors: ${json.errors.map((e) => e.message).join(" | ")}`);
   }
 
-  const raw = json.data?.pools;
-  if (!Array.isArray(raw) || raw.length === 0) {
+  const arr = Array.isArray(json.data?.pairs) ? json.data.pairs : [];
+  if (!arr.length) {
     throw new Error("Sushi subgraph schema mismatch or empty response");
   }
 
-  return raw.map((p) => {
+  const items = arr.map((p) => {
     const t0 = p?.token0?.symbol || "?";
     const t1 = p?.token1?.symbol || "?";
     const name = `${t0} / ${t1}`;
 
-    // reserveUSD는 string으로 오는 경우가 많음 -> safeNum이 Number 변환
     const tvlUsd = safeNum(p.reserveUSD ?? 0, 0);
+    const volUsd = safeNum(p.volumeUSD ?? 0, 0);
 
-    let feePct = null;
-    if (p.swapFee != null) {
-      const f = safeNum(p.swapFee, NaN);
-      if (Number.isFinite(f)) feePct = f <= 0.05 ? f * 100 : f;
-    }
+    // ✅ swapFee 필드가 없으므로 v2 기본 수수료(0.3%)를 고정 표시
+    const feePct = 0.3;
 
     return {
       id: p.id,
       name,
       tvlUsd,
       tvlText: formatUsdCompact(tvlUsd),
+      volumeUsd: volUsd,
       feePct,
       url: `https://www.sushi.com/ethereum/pool/${p.id}`,
     };
   });
-}
 
-/** 실패 대비: 3회 재시도 (짧은 backoff) */
-async function fetchWithRetry(args, tries = 3) {
-  let lastErr = null;
-  for (let i=0;i<tries;i++){
-    try {
-      return await fetchSushiPoolsFromGraphql(args);
-    } catch (e) {
-      lastErr = e;
-      // 0.6s, 1.2s 정도로 가볍게 backoff
-      await sleep(600 * (i+1));
-    }
-  }
-  throw lastErr;
+  return items;
 }
 
 app.get("/sushi/pools", async (req, res) => {
-  const chain = String(req.query.chain || "ethereum").toLowerCase();
-  const limit = Math.max(1, Math.min(10, Number(req.query.limit || 5)));
-  const cacheKey = `${chain}|${limit}`;
-  const now = Date.now();
-
-  // ✅ 1) TTL 내 캐시가 있으면 즉시 반환
-  const cached = __sushiCache.get(cacheKey);
-  if (cached && now - cached.ts < SUSHI_CACHE_TTL_MS) {
-    return res.json({ ok: true, chain, cached: true, stale: false, items: cached.data });
-  }
-
-  // ✅ 2) TTL 지났더라도 "마지막 정상값"이 있으면, 실패 시 그걸로 버팀
-  const lastGood = cached?.data;
-
   try {
-    const items = await fetchWithRetry({ chain, limit }, 3);
+    const chain = String(req.query.chain || "ethereum").toLowerCase();
+    const limit = Math.max(1, Math.min(10, Number(req.query.limit || 5)));
 
-    // 정상값만 캐시에 저장(빈 배열/이상응답으로 덮어쓰기 금지)
-    if (Array.isArray(items) && items.length) {
-      __sushiCache.set(cacheKey, { ts: now, data: items });
+    const cacheKey = `${chain}|${limit}`;
+    const cached = __sushiCache.get(cacheKey);
+    const now = Date.now();
+
+    if (cached && now - cached.ts < SUSHI_CACHE_TTL_MS) {
+      return res.json({ ok: true, chain, cached: true, items: cached.data });
     }
 
-    return res.json({ ok: true, chain, cached: false, stale: false, items });
+    const items = await fetchSushiPoolsFromGraphql({ chain, limit });
+    __sushiCache.set(cacheKey, { ts: now, data: items });
+
+    return res.json({ ok: true, chain, cached: false, items });
   } catch (e) {
     console.error("[/sushi/pools] error:", e?.message || e);
 
-    // ✅ 3) 실패 시: lastGood가 있으면 그걸 반환(프런트는 계속 TVL 표시)
-    if (Array.isArray(lastGood) && lastGood.length) {
-      return res.status(200).json({
-        ok: true,
-        chain,
-        cached: true,
-        stale: true,                  // ✅ "갱신 실패했지만 이전값 제공"
-        error: String(e?.message || e),
-        items: lastGood,
-      });
-    }
-
-    // ✅ 4) 정말 아무것도 없을 때만 더미
+    // 프런트가 "—"로라도 안전하게 뜨도록 fallback 유지
     return res.status(200).json({
       ok: false,
-      chain,
       error: String(e?.message || e),
       items: [
         { id: "0x0", name: "WBTC / ETH", tvlUsd: 0, tvlText: "$—", feePct: 0.3, url: "https://www.sushi.com/ethereum/explore/pools" },
         { id: "0x0", name: "DAI / ETH",  tvlUsd: 0, tvlText: "$—", feePct: 0.3, url: "https://www.sushi.com/ethereum/explore/pools" },
         { id: "0x0", name: "USDC / ETH", tvlUsd: 0, tvlText: "$—", feePct: 0.3, url: "https://www.sushi.com/ethereum/explore/pools" },
+        { id: "0x0", name: "SUSHI / ETH",tvlUsd: 0, tvlText: "$—", feePct: 0.3, url: "https://www.sushi.com/ethereum/explore/pools" },
+        { id: "0x0", name: "LINK / ETH", tvlUsd: 0, tvlText: "$—", feePct: 0.3, url: "https://www.sushi.com/ethereum/explore/pools" },
       ],
     });
   }
 });
-
 
 /* =========================
    📰 Crypto News Section (NEW)
@@ -659,6 +625,7 @@ app.get("/api/crypto-news", (req, res) => {
    Listen
    ========================= */
 app.listen(PORT, () => console.log(`G-DEX backend listening on port ${PORT}`));
+
 
 
 
