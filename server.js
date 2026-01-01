@@ -372,59 +372,104 @@ function safeNum(n, fallback = 0) {
   return Number.isFinite(x) ? x : fallback;
 }
 
-function formatUsdCompact(v) {
+// ✅ 표시 개선: 작은 값은 $0.00 대신 "<$0.01"
+function formatUsdSmart(v) {
   const n = safeNum(v, 0);
 
-  if (n === 0) return "$0";
-  if (n > 0 && n < 0.01) return "<$0.01";     // ✅ 핵심: 초소액은 0.00 대신 이렇게
-  if (n < 1) return `$${n.toFixed(4)}`;       // ✅ 1달러 미만은 4자리
-  if (n >= 1e9) return `$${(n / 1e9).toFixed(2)}b`;
-  if (n >= 1e6) return `$${(n / 1e6).toFixed(2)}m`;
-  if (n >= 1e3) return `$${(n / 1e3).toFixed(2)}k`;
-  return `$${n.toFixed(2)}`;
+  if (n > 0 && n < 0.01) return "<$0.01";
+  if (n >= 1e12) return `$${(n / 1e12).toFixed(2)}t`;
+  if (n >= 1e9)  return `$${(n / 1e9).toFixed(2)}b`;
+  if (n >= 1e6)  return `$${(n / 1e6).toFixed(2)}m`;
+  if (n >= 1e3)  return `$${(n / 1e3).toFixed(2)}k`;
+  if (n >= 1)    return `$${n.toFixed(2)}`;
+  return `$${n.toFixed(4)}`; // 0~1 구간은 조금 더 자세히
 }
-
 
 /**
- * sushiswap/exchange (UniswapV2-style) 기준:
- * - entity: pairs
- * - fields: id, createdAtTimestamp, token0{symbol}, token1{symbol}, reserveUSD, volumeUSD ...
- * - swapFee 같은 필드는 없음(스키마 mismatch 원인)
+ * NOTE:
+ * sushiswap/exchange 서브그래프(pair/pairs) 기준 쿼리
+ * reserveUSD/volumeUSD 는 문자열로 오는 경우가 많음(그래서 Number() 처리)
  */
-async function fetchSushiPoolsFromGraphql({ chain="ethereum", limit=5 }) {
-  const query = `
-    query Pools($first:Int!) {
-      pools: pairs(first: $first, orderBy: createdAtTimestamp, orderDirection: desc) {
-        id
-        createdAtTimestamp
-        token0 { symbol }
-        token1 { symbol }
-        reserveUSD
-        volumeUSD
-        swapFee
+async function fetchSushiPoolsFromGraphql({ limit = 5 }) {
+  if (!SUSHI_SUBGRAPH_URL) {
+    throw new Error("SUSHI_SUBGRAPH_URL env is missing");
+  }
+
+  const first = Math.max(1, Math.min(20, Number(limit) || 5));
+
+  // ✅ “전부 0” 방지: reserveUSD 임계값을 단계적으로 낮춰가며 limit 채우기
+  const thresholds = ["100000", "10000", "1000", "100", "10", "0"]; // USD 기준
+  let finalPairs = [];
+
+  for (const th of thresholds) {
+    const query = `
+      query Pools($first:Int!, $minReserve:String!) {
+        pools: pairs(
+          first: $first,
+          orderBy: createdAtTimestamp,
+          orderDirection: desc,
+          where: { reserveUSD_gt: $minReserve }
+        ) {
+          id
+          createdAtTimestamp
+          token0 { symbol }
+          token1 { symbol }
+          reserveUSD
+          volumeUSD
+          swapFee
+        }
       }
+    `;
+
+    const body = JSON.stringify({
+      query,
+      variables: { first, minReserve: th },
+    });
+
+    const r = await fetchFn(SUSHI_SUBGRAPH_URL, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body,
+    });
+
+    if (!r.ok) {
+      const t = await r.text().catch(() => "");
+      throw new Error(`GraphQL HTTP ${r.status}: ${t.slice(0, 200)}`);
     }
-  `;
 
-  const first = 80; // ✅ 넉넉히 가져오기
-  ...
-  const mapped = (json.data?.pools || []).map(...);
+    const json = await r.json();
+    if (json.errors?.length) {
+      throw new Error(
+        `GraphQL errors: ${json.errors.map((e) => e.message).join(" | ")}`
+      );
+    }
 
-  // ✅ TVL 0 제거(원하면 기준을 1달러 이상으로 올려도 됨)
-  const nonZero = mapped.filter(p => safeNum(p.tvlUsd, 0) > 0);
+    const pairs = Array.isArray(json.data?.pools) ? json.data.pools : [];
+    if (pairs.length >= Math.min(3, first)) { // 너무 적게 잡히면 다음 단계로
+      finalPairs = pairs;
+      break;
+    }
+  }
 
-  return nonZero.slice(0, limit);
-}
+  const pools = finalPairs.slice(0, first).map((p) => {
+    const t0 = p?.token0?.symbol || "?";
+    const t1 = p?.token1?.symbol || "?";
+    const name = `${t0} / ${t1}`;
 
+    const tvlUsd = safeNum(p.reserveUSD ?? 0, 0);
+    const volUsd = safeNum(p.volumeUSD ?? 0, 0);
 
-    // V2는 보통 0.30% 표시(참고용)
-    const feePct = 0.3;
+    let feePct = null;
+    if (p.swapFee != null) {
+      const f = safeNum(p.swapFee, NaN);
+      if (Number.isFinite(f)) feePct = f <= 0.05 ? f * 100 : f;
+    }
 
     return {
       id: p.id,
       name,
       tvlUsd,
-      tvlText: formatUsdCompact(tvlUsd),
+      tvlText: formatUsdSmart(tvlUsd),
       volumeUsd: volUsd,
       feePct,
       url: `https://www.sushi.com/ethereum/pool/${p.id}`,
@@ -447,14 +492,13 @@ app.get("/sushi/pools", async (req, res) => {
       return res.json({ ok: true, chain, cached: true, items: cached.data });
     }
 
-    const items = await fetchSushiPoolsFromGraphql({ chain, limit });
+    // ✅ chain은 현재 쿼리에서 사용하지 않지만, 파라미터는 유지(확장 대비)
+    const items = await fetchSushiPoolsFromGraphql({ limit });
     __sushiCache.set(cacheKey, { ts: now, data: items });
 
     return res.json({ ok: true, chain, cached: false, items });
   } catch (e) {
     console.error("[/sushi/pools] error:", e?.message || e);
-
-    // 실패 시에도 프런트가 깨지지 않게 형태 유지 (tvlText는 $— 로)
     return res.status(200).json({
       ok: false,
       error: String(e?.message || e),
@@ -462,12 +506,11 @@ app.get("/sushi/pools", async (req, res) => {
         { id: "0x0", name: "WBTC / ETH", tvlText: "$—", feePct: 0.3, url: "https://www.sushi.com/ethereum/explore/pools" },
         { id: "0x0", name: "DAI / ETH",  tvlText: "$—", feePct: 0.3, url: "https://www.sushi.com/ethereum/explore/pools" },
         { id: "0x0", name: "USDC / ETH", tvlText: "$—", feePct: 0.3, url: "https://www.sushi.com/ethereum/explore/pools" },
-        { id: "0x0", name: "SUSHI / ETH",tvlText: "$—", feePct: 0.3, url: "https://www.sushi.com/ethereum/explore/pools" },
-        { id: "0x0", name: "LINK / ETH", tvlText: "$—", feePct: 0.3, url: "https://www.sushi.com/ethereum/explore/pools" },
       ],
     });
   }
 });
+
 
 /* =========================
    📰 Crypto News Section (NEW)
@@ -603,6 +646,7 @@ app.get("/api/crypto-news", (req, res) => {
    Listen
    ========================= */
 app.listen(PORT, () => console.log(`G-DEX backend listening on port ${PORT}`));
+
 
 
 
