@@ -72,6 +72,19 @@ if (!RPC_URL) console.warn("[WARN] RPC_URL is not set. Gas estimation will be sk
 /* =========================
    Helpers
    ========================= */
+function assertSupportedChain(chainId) {
+  const id = Number(chainId || 1);
+
+  // 현재 G-DEX 구조가 이더리움 메인넷만 쓰는 상태라면 이렇게 가장 안전
+  if (id !== 1) {
+    const err = new Error(`Unsupported chainId: ${id}. Only Ethereum Mainnet is supported.`);
+    err.status = 400;
+    err.details = { code: "UNSUPPORTED_CHAIN", chainId: id };
+    throw err;
+  }
+
+  return id;
+}
 function isHexAddress(a) {
   return typeof a === "string" && /^0x[a-fA-F0-9]{40}$/.test(a);
 }
@@ -117,7 +130,7 @@ async function call0x(url) {
 }
 
 function buildParams(body) {
-  const chainId = body.chainId || 1; // mainnet default
+  const chainId = assertSupportedChain(body.chainId || 1);
   const { sellToken, buyToken, sellAmount, taker } = body;
 
   // slippagePercentage: 프런트는 0.02(=2%) 형태로 전달 가정
@@ -565,7 +578,7 @@ async function fetchOneRss(src) {
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), 8000); // 8초 타임아웃
   try {
-    const res = await fetch(src.url, {
+    const res = await fetchFn(src.url, {
       method: "GET",
       headers: {
         "User-Agent": "G-DEX-NewsFetcher/1.0",
